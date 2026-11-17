@@ -1,0 +1,6 @@
+# actionlint v1.7.12 predates the job.workflow_* context properties GitHub
+# added for reusable workflows; drop this once actionlint knows them.
+paths:
+  .github/workflows/go.yml:
+    ignore:
+      - 'property "workflow_(sha|repository)" is not defined in object type'
