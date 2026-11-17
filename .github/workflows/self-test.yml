@@ -1,0 +1,26 @@
+# Calls the reusable workflow against testdata/fixture, a Project with one ko
+# Deployable, one build: dockerfile Deployable and one Tool. The fixture input
+# forces the build-only path (as on a pull request): nothing is logged in to
+# or pushed.
+name: self-test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  go:
+    uses: ./.github/workflows/go.yml
+    with:
+      fixture: testdata/fixture
+    secrets:
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}

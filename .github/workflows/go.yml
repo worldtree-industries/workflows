@@ -1,0 +1,202 @@
+# Reusable CI for Ivaldi Go Projects: lint, test, and build the affected
+# Deployables' images, pushing them to Harbor on main and vX.Y.Z tag pushes.
+# See the README for how to call it.
+name: go
+
+on:
+  workflow_call:
+    inputs:
+      fixture:
+        description: >-
+          Internal, for this repository's self-test only: a directory of the
+          caller's repository to use as the Project instead of the repository
+          itself. Forces a build-only run. Projects must not set it.
+        type: string
+        required: false
+        default: ''
+    secrets:
+      HARBOR_USERNAME:
+        description: Harbor robot account with push rights on library.
+        required: true
+      HARBOR_PASSWORD:
+        description: Password for HARBOR_USERNAME.
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: registry.werewolves.fyi
+  GOLANGCI_LINT_VERSION: v2.14.0
+  KO_VERSION: v0.19.1
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the self-test fixture as the Project
+        if: inputs.fixture != ''
+        env:
+          FIXTURE: ${{ inputs.fixture }}
+        run: &use-fixture |
+          tmp="$(mktemp -d)"
+          cp -a "$FIXTURE/." "$tmp/"
+          find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          cp -a "$tmp/." .
+          git init -q -b main
+          git add -A
+          git -c user.name=self-test -c user.email=self-test@invalid commit -q -m fixture
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the self-test fixture as the Project
+        if: inputs.fixture != ''
+        env:
+          FIXTURE: ${{ inputs.fixture }}
+        run: *use-fixture
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+
+  # Works out which Deployables the images job builds, the image tag and
+  # whether to push, using this repository's commands at the same commit as
+  # this workflow.
+  affected:
+    runs-on: ubuntu-latest
+    outputs:
+      deployables: ${{ steps.affected.outputs.deployables }}
+      tag: ${{ steps.plan.outputs.tag }}
+      push: ${{ steps.plan.outputs.push }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the affected command needs the base commit and tags
+          persist-credentials: false
+      - name: Use the self-test fixture as the Project
+        if: inputs.fixture != ''
+        env:
+          FIXTURE: ${{ inputs.fixture }}
+        run: *use-fixture
+      - name: Check out this workflow's commands
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _workflows
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build the commands
+        env:
+          GOTOOLCHAIN: auto
+        run: go build -C _workflows -o "$RUNNER_TEMP/workflows-bin/" ./cmd/affected ./cmd/plan
+      - name: Plan
+        id: plan
+        env:
+          EVENT: ${{ inputs.fixture != '' && 'self-test' || github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          plan="$("$RUNNER_TEMP/workflows-bin/plan" -repo . -event "$EVENT" -ref "$REF" -sha "$SHA" -before "$BEFORE" -pr-base "$PR_BASE")"
+          echo "$plan"
+          echo "$plan" >> "$GITHUB_OUTPUT"
+      - name: Find affected Deployables
+        id: affected
+        env:
+          BASE: ${{ steps.plan.outputs.base }}
+        run: |
+          deployables="$("$RUNNER_TEMP/workflows-bin/affected" -repo . -base "$BASE" -head HEAD)"
+          echo "$deployables"
+          echo "deployables=$deployables" >> "$GITHUB_OUTPUT"
+
+  images:
+    name: image (${{ matrix.name }})
+    needs: [lint, test, affected]
+    if: needs.affected.outputs.deployables != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.affected.outputs.deployables) }}
+    env:
+      IMAGE: registry.werewolves.fyi/library/${{ matrix.name }}
+      TAG: ${{ needs.affected.outputs.tag }}
+      PUSH: ${{ needs.affected.outputs.push == 'true' && github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use the self-test fixture as the Project
+        if: inputs.fixture != ''
+        env:
+          FIXTURE: ${{ inputs.fixture }}
+        run: *use-fixture
+
+      - name: Log in to Harbor Registry
+        if: env.PUSH == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      # ko: every Deployable without build: dockerfile, on its base image.
+      - if: matrix.build == 'ko'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install ko
+        if: matrix.build == 'ko'
+        run: go install "github.com/google/ko@$KO_VERSION"
+      - name: Build with ko
+        if: matrix.build == 'ko'
+        env:
+          NAME: ${{ matrix.name }}
+          KO_DOCKER_REPO: ${{ env.IMAGE }}
+          KO_DEFAULTBASEIMAGE: ${{ matrix.base_image }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: |
+          ko build "./cmd/$NAME" \
+            --bare \
+            --platform=linux/amd64 \
+            --tags="$TAG" \
+            --push="$PUSH" \
+            --sbom=none \
+            --image-label="org.opencontainers.image.source=$SOURCE" \
+            --image-label="org.opencontainers.image.revision=$REVISION"
+
+      # build: dockerfile: the Deployable's own cmd/<name>/Dockerfile, with the
+      # Project root as context.
+      - if: matrix.build == 'dockerfile'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - if: matrix.build == 'dockerfile'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: cmd/${{ matrix.name }}/Dockerfile
+          platforms: linux/amd64
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}

@@ -1,0 +1,13 @@
+# Self-test fixture Project for .github/workflows/go.yml: one ko-built
+# Deployable, one Dockerfile-built Deployable and one Tool (never built).
+version: 1
+binaries:
+  hello:
+    kind: http
+    port: 8080
+  boxed:
+    kind: job
+    schedule: none
+    build: dockerfile
+  cli:
+    kind: tool
