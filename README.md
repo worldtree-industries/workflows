@@ -56,16 +56,40 @@ same commit it was called at, so the pin covers them too.
 Pass only these two, by name; never `secrets: inherit`. The workflow requests
 no permissions beyond `contents: read`, so the caller needs nothing more.
 
-| Input     | Default | Meaning |
-|-----------|---------|---------|
-| `fixture` | `''`    | Internal, for this repository's self-test: a directory of the caller's repository to use as the Project. Forces a build-only run. Projects must not set it. |
+| Input       | Default       | Meaning |
+|-------------|---------------|---------|
+| `platforms` | `linux/amd64` | Comma-separated platforms to build every Deployable's image for, as `os/arch[/variant]` with no spaces, for example `linux/amd64,linux/arm64`. With more than one, each image is a multi-platform index under its one tag. Empty means `linux/amd64`. |
+| `fixture`   | `''`          | Internal, for this repository's self-test: a directory of the caller's repository to use as the Project. Forces a build-only run. Projects must not set it. |
+
+To build multi-platform images, add `with:` to the caller's job:
+
+```yaml
+jobs:
+  go:
+    uses: worldtree-industries/workflows/.github/workflows/go.yml@<commit-sha> # vX.Y.Z
+    with:
+      platforms: linux/amd64,linux/arm64
+    secrets:
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+```
+
+ko cross-compiles, so ko Deployables build for any platform Go and their
+`base_image` support. `build: dockerfile` Deployables are built with buildx
+for the same platforms, but no emulation (QEMU) is set up, so for any
+platform other than the runner's `linux/amd64` the Dockerfile must
+cross-compile: run its build stage `FROM --platform=$BUILDPLATFORM …` and
+build with `GOOS=$TARGETOS GOARCH=$TARGETARCH` (see
+`testdata/fixture/cmd/boxed/Dockerfile`). A Dockerfile that runs commands in
+a target-platform stage fails for non-native platforms.
 
 ### Jobs
 
 - **lint**: golangci-lint v2.14.0 with the Project's own config.
 - **test**: `go test -race ./...`, with Go from the Project's `go.mod`.
 - **affected**: runs `plan` and `affected` (below) to decide what to build.
-- **images**: one job per affected Deployable, for `linux/amd64`, as
+- **images**: one job per affected Deployable, for the `platforms` input
+  (default `linux/amd64`), as
   `registry.werewolves.fyi/library/<name>`. Deployables with
   `build: dockerfile` are built with `docker build` from
   `cmd/<name>/Dockerfile` with the Project root as context; all others with
@@ -100,7 +124,8 @@ ko is installed with `go install github.com/google/ko@v0.19.1`, not an action.
 `.github/workflows/self-test.yml` calls the workflow on every pull request and
 push to `main` with `fixture: testdata/fixture`, a Project with one ko
 Deployable, one `build: dockerfile` Deployable and one Tool, exercising the
-build-only path.
+build-only path. It calls it twice: once with the default `platforms`, and
+once with `platforms: linux/amd64,linux/arm64`.
 
 ## `cmd/plan`: what the images job does
 
@@ -160,7 +185,10 @@ A Deployable is affected when, between base and head:
 
 - a changed or deleted file belongs to a Go package in the main module that is
   in the dependency closure of `cmd/<name>` (built for `linux/amd64`,
-  `CGO_ENABLED=0`). A file belongs to a package when it's a source file
+  `CGO_ENABLED=0`, whatever the workflow's `platforms`; any change to a
+  source file in a package's directory counts, whatever its build
+  constraints, so only a package imported solely on another platform is
+  missed). A file belongs to a package when it's a source file
   (`.go`, `.s`, `.c`, `.syso`, …) in the package's directory or a file the
   package embeds;
 - its `.forge.yaml` entry changed in any key (`kind`, `port`, `schedule`,

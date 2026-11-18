@@ -14,6 +14,15 @@ on:
         type: string
         required: false
         default: ''
+      platforms:
+        description: >-
+          Comma-separated platforms to build every Deployable's image for,
+          as os/arch[/variant] (for example linux/amd64,linux/arm64). With
+          more than one, the image is a multi-platform index under one tag.
+          Empty means linux/amd64.
+        type: string
+        required: false
+        default: linux/amd64
     secrets:
       HARBOR_USERNAME:
         description: Harbor robot account with push rights on library.
@@ -173,10 +182,11 @@ jobs:
           KO_DEFAULTBASEIMAGE: ${{ matrix.base_image }}
           SOURCE: ${{ github.server_url }}/${{ github.repository }}
           REVISION: ${{ github.sha }}
+          PLATFORMS: ${{ inputs.platforms || 'linux/amd64' }}
         run: |
           ko build "./cmd/$NAME" \
             --bare \
-            --platform=linux/amd64 \
+            --platform="$PLATFORMS" \
             --tags="$TAG" \
             --push="$PUSH" \
             --sbom=none \
@@ -184,7 +194,9 @@ jobs:
             --image-label="org.opencontainers.image.revision=$REVISION"
 
       # build: dockerfile: the Deployable's own cmd/<name>/Dockerfile, with the
-      # Project root as context.
+      # Project root as context. No emulation is set up, so a Dockerfile built
+      # for a platform other than the runner's (linux/amd64) must cross-compile
+      # (FROM --platform=$BUILDPLATFORM, then TARGETOS/TARGETARCH).
       - if: matrix.build == 'dockerfile'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - if: matrix.build == 'dockerfile'
@@ -192,7 +204,7 @@ jobs:
         with:
           context: .
           file: cmd/${{ matrix.name }}/Dockerfile
-          platforms: linux/amd64
+          platforms: ${{ inputs.platforms || 'linux/amd64' }}
           push: ${{ env.PUSH == 'true' }}
           tags: ${{ env.IMAGE }}:${{ env.TAG }}
           labels: |
