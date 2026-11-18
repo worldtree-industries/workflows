@@ -24,3 +24,14 @@ jobs:
     secrets:
       HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
       HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+  # The same fixture built for more than one platform, so both the ko and
+  # the build: dockerfile paths are exercised as multi-platform builds.
+  go-multi-platform:
+    uses: ./.github/workflows/go.yml
+    with:
+      fixture: testdata/fixture
+      platforms: linux/amd64,linux/arm64
+    secrets:
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
