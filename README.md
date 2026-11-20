@@ -15,6 +15,7 @@ name: ci
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [main]
     tags: ['v*.*.*']
@@ -28,11 +29,18 @@ concurrency:
 
 jobs:
   go:
+    permissions:
+      contents: write
+      issues: read
+      pull-requests: read
     uses: worldtree-industries/workflows/.github/workflows/go.yml@<commit-sha> # vX.Y.Z
     secrets:
       HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
       HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
 ```
+
+`labeled` and `unlabeled` re-run a pull request's CI when its semver label
+changes, so its release dry run is for the label it will merge with.
 
 ### Pinning by SHA
 
@@ -53,8 +61,12 @@ same commit it was called at, so the pin covers them too.
 | `HARBOR_USERNAME` | yes      | Harbor robot account with push rights on `library`. An org-level secret; pass it by name. |
 | `HARBOR_PASSWORD` | yes      | Its password. An org-level secret; pass it by name. |
 
-Pass only these two, by name; never `secrets: inherit`. The workflow requests
-no permissions beyond `contents: read`, so the caller needs nothing more.
+Pass only these two, by name; never `secrets: inherit`.
+
+The caller's job must grant `contents: write` (pushing the release tag),
+`issues: read` and `pull-requests: read` (reading the merged pull request's
+labels). Each of the workflow's jobs asks only for what it uses: everything
+but `affected` and `release` runs with `contents: read`.
 
 | Input       | Default       | Meaning |
 |-------------|---------------|---------|
@@ -95,16 +107,61 @@ a target-platform stage fails for non-native platforms.
   `cmd/<name>/Dockerfile` with the Project root as context; all others with
   ko (`ko build ./cmd/<name>`) on their `base_image`. Runs only after lint and
   test pass, and is skipped when nothing is affected.
+- **release**: on a merge to `main`, pushes the release's `vX.Y.Z` git tag at
+  the merge commit, after lint, test and every image have succeeded (or no
+  image needed building). A failed run leaves no tag, so re-running it retries
+  the whole release.
 
-| Event                           | Compared against                | Image tag      | Pushed |
-|---------------------------------|---------------------------------|----------------|--------|
-| push of a `vX.Y.Z` tag          | the highest lower `vX.Y.Z` tag (none: every Deployable) | `vX.Y.Z` | yes |
-| push to `main`                  | the branch's previous tip (`github.event.before`; its parent after a force push) | `sha-<short>` | yes |
-| pull request                    | the pull request's base commit  | `sha-<short>`  | no: never logs in |
-| anything else                   | nothing: every Deployable       | `sha-<short>`  | no     |
+| Event                           | Compared against                | Image tag      | Pushed | Git tag pushed |
+|---------------------------------|---------------------------------|----------------|--------|----------------|
+| merge to `main`                 | the previous release (none: every Deployable) | the next `vX.Y.Z` | yes | the next `vX.Y.Z` |
+| merge to `main` already tagged `vX.Y.Z` (a re-run) | the release below it | `vX.Y.Z` | yes | no |
+| any other push to `main`        | the branch's previous tip (`github.event.before`; its parent after a force push) | `sha-<short>` | yes | no |
+| push of a `vX.Y.Z` tag          | the highest lower `vX.Y.Z` tag (none: every Deployable) | `vX.Y.Z` | yes | no |
+| pull request                    | the pull request's base commit  | `sha-<short>`  | no: never logs in | no |
+| anything else                   | nothing: every Deployable       | `sha-<short>`  | no     | no |
 
 `<short>` is the first 7 hex digits of the commit. Unaffected Deployables
-aren't rebuilt or retagged.
+aren't rebuilt or retagged, so a release has images only for the Deployables
+it changed.
+
+### Releases
+
+Every merge to `main` releases. The previous release is the highest `vX.Y.Z`
+tag reachable from the merge commit (tags on other branches don't count), or
+`v0.0.0` when there is none. The merged pull request's labels choose the bump:
+
+| Label          | Release            |
+|----------------|--------------------|
+| `semver:major` | `v1.4.2` → `v2.0.0` |
+| `semver:minor` | `v1.4.2` → `v1.5.0` |
+| neither        | `v1.4.2` → `v1.4.3` |
+
+A forgotten label ships a feature as a patch, which under-promises rather than
+publishing an inflated version.
+
+- **Only merge commits release.** A merge commit is found by its parents, and
+  its pull request by GitHub's default subject, `Merge pull request #N from …`.
+  A push that isn't a merge commit builds `sha-<short>` images and releases
+  nothing. A merge commit whose subject names no pull request fails the run:
+  tag it by hand. Squash and rebase merges aren't merge commits, so a Project
+  must allow only merge commits, with GitHub's default message.
+- **The module path must match the major.** Go needs a `/vN` module path for
+  every major `N >= 2`, so a release to `v2.0.0` needs the module path renamed
+  to `…/v2` in the same pull request, and a `…/v2` module path releases only
+  `v2.x.y`. Otherwise the run fails before building anything.
+- **Pull requests dry-run their release.** The `affected` job works out the
+  version the pull request's merge would release, logs it, and fails the
+  pull request if that release would be rejected.
+- **Reading labels is retried three times**, then fails the run rather than
+  guessing a version.
+- **Tags pushed by `GITHUB_TOKEN` start no workflow runs**, so the release tag
+  doesn't start another run of the Project's CI: the merge's run already built
+  the release's images.
+- **Merges in quick succession can share a release.** The caller's
+  `concurrency` group runs one push to `main` at a time and keeps only the
+  newest one waiting, so a merge whose run was replaced while waiting is
+  released by the next merge's run, with that pull request's bump.
 
 ### Third-party actions
 
@@ -124,30 +181,37 @@ ko is installed with `go install github.com/google/ko@v0.19.1`, not an action.
 `.github/workflows/self-test.yml` calls the workflow on every pull request and
 push to `main` with `fixture: testdata/fixture`, a Project with one ko
 Deployable, one `build: dockerfile` Deployable and one Tool, exercising the
-build-only path. It calls it twice: once with the default `platforms`, and
+build-only path. It never reads labels or pushes a tag; the release decision
+is covered by `internal/plan`'s tests. It calls it twice: once with the default `platforms`, and
 once with `platforms: linux/amd64,linux/arm64`.
 
-## `cmd/plan`: what the images job does
+## `cmd/plan`: what the images and release jobs do
 
 Prints, as GitHub Actions step outputs, what the images job compares against,
-the image tag and whether to push, following the table above.
+the image tag, whether to push and which release to publish, following the
+tables above.
 
 ```sh
 go run ./cmd/plan -repo <dir> -event <github.event_name> -ref <github.ref> \
-  -sha <github.sha> [-before <github.event.before>] [-pr-base <base sha>]
+  -sha <github.sha> [-before <github.event.before>] [-pr-base <base sha>] \
+  [-pr <pull request number>] [-github-repo <owner/name>]
 ```
 
-On success it exits 0 and prints three lines:
+On success it exits 0 and prints four lines:
 
 ```
 base=v1.0.0
 tag=v1.1.0
 push=true
+release=v1.1.0
 ```
 
 `base` is empty for a first release (pass it to `affected -base` as is).
-`-sha` is required. Errors print to stderr and exit 1 (git failure) or 2 (bad
-flags).
+`release` is the git tag to push, or empty. `-sha` is required. `-pr` turns
+on a pull request's release dry run. Reading labels needs `-github-repo`, the
+`gh` CLI and `GH_TOKEN`. The reasoning, including a dry run's version, goes to
+stderr. Errors print to stderr and exit 1 (git failure, unreadable labels, a
+rejected release) or 2 (bad flags).
 
 ## `cmd/affected`: affected Deployables
 

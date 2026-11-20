@@ -1,6 +1,8 @@
 # Reusable CI for Ivaldi Go Projects: lint, test, and build the affected
 # Deployables' images, pushing them to Harbor on main and vX.Y.Z tag pushes.
-# See the README for how to call it.
+# Every merge to main is a release: its images are tagged with the next
+# version, chosen by the pull request's semver labels, and then that version
+# is pushed as a git tag. See the README for how to call it.
 name: go
 
 on:
@@ -81,15 +83,23 @@ jobs:
           go-version-file: go.mod
       - run: go test -race ./...
 
-  # Works out which Deployables the images job builds, the image tag and
-  # whether to push, using this repository's commands at the same commit as
-  # this workflow.
+  # Works out which Deployables the images job builds, the image tag, whether
+  # to push and which release to publish, using this repository's commands at
+  # the same commit as this workflow. On a pull request it also dry-runs the
+  # release its merge would publish, so a rejected release fails before the
+  # merge rather than after.
   affected:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Reading a pull request's labels, which choose the release's bump.
+      issues: read
+      pull-requests: read
     outputs:
       deployables: ${{ steps.affected.outputs.deployables }}
       tag: ${{ steps.plan.outputs.tag }}
       push: ${{ steps.plan.outputs.push }}
+      release: ${{ steps.plan.outputs.release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -122,8 +132,11 @@ jobs:
           SHA: ${{ github.sha }}
           BEFORE: ${{ github.event.before }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          plan="$("$RUNNER_TEMP/workflows-bin/plan" -repo . -event "$EVENT" -ref "$REF" -sha "$SHA" -before "$BEFORE" -pr-base "$PR_BASE")"
+          plan="$("$RUNNER_TEMP/workflows-bin/plan" -repo . -event "$EVENT" -ref "$REF" -sha "$SHA" -before "$BEFORE" -pr-base "$PR_BASE" -pr "${PR:-0}" -github-repo "$REPOSITORY")"
           echo "$plan"
           echo "$plan" >> "$GITHUB_OUTPUT"
       - name: Find affected Deployables
@@ -212,3 +225,30 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # Publishes the release as a lightweight vX.Y.Z git tag, last, so that a
+  # failed build never leaves a tag without its images: re-running the run
+  # retries the whole release. Skipped images (nothing affected) still
+  # release. The tag is pushed with GITHUB_TOKEN, so it doesn't start another
+  # run of the Project's CI.
+  release:
+    needs: [lint, test, affected, images]
+    if: >-
+      !cancelled() && inputs.fixture == '' &&
+      needs.affected.outputs.release != '' &&
+      needs.lint.result == 'success' && needs.test.result == 'success' &&
+      needs.affected.result == 'success' &&
+      (needs.images.result == 'success' || needs.images.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Push the release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.affected.outputs.release }}
+          SHA: ${{ github.sha }}
+        run: |
+          gh api --method POST "repos/$REPOSITORY/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$SHA" --silent
+          echo "released $TAG at $SHA"
